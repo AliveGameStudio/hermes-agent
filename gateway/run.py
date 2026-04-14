@@ -7482,38 +7482,47 @@ class GatewayRunner:
         unified_card_cursor = [""]
         unified_card_state = {
             "progress_lines": [],
-            "response_text": "",
             "thinking": "",
+            "active_tool_indices": {},
         }
 
-        def _format_tool_result_preview(result_preview: Optional[str]) -> str:
-            text = str(result_preview or "").strip()
+        def _compact_card_text(value: Optional[str], *, limit: int = 140) -> str:
+            text = str(value or "").strip()
             if not text:
                 return ""
             text = " ".join(text.split())
-            if len(text) > 280:
-                text = text[:277] + "..."
-            return f"-> {text}"
+            if len(text) > limit:
+                text = text[: limit - 3] + "..."
+            return text
 
-        def _render_progress_card(answer_text: Optional[str] = None, *, strip_cursor: bool = False) -> str:
-            if answer_text is not None:
-                unified_card_state["response_text"] = answer_text
-            response_text = str(unified_card_state.get("response_text") or "")
-            if strip_cursor and unified_card_cursor[0]:
-                response_text = response_text.replace(unified_card_cursor[0], "")
+        def _format_tool_started_line(tool_name: str, emoji: str, preview: Optional[str]) -> str:
+            compact_preview = _compact_card_text(preview)
+            header = f"{emoji} **{tool_name}**"
+            if compact_preview:
+                return f"{header}\nPreview: `{compact_preview}`"
+            return f"{header}\nPreview: `(none)`"
+
+        def _format_tool_completed_line(tool_name: str, duration: float, is_error: bool, result_preview: Optional[str]) -> str:
+            compact_result = _compact_card_text(result_preview, limit=220)
+            header = f"{'❌' if is_error else '✅'} **{tool_name}** · {duration:.1f}s"
+            if compact_result:
+                return f"{header}\nResult: {compact_result}"
+            return f"{header}\nResult: `(no summary)`"
+
+        def _render_progress_card(*, strip_cursor: bool = False) -> str:
             thinking_text = str(unified_card_state.get("thinking") or "").strip()
+            if strip_cursor and unified_card_cursor[0]:
+                thinking_text = thinking_text.replace(unified_card_cursor[0], "")
             progress_lines = list(unified_card_state["progress_lines"])
 
             sections = []
             if thinking_text:
                 sections.append("**Thinking**\n" + thinking_text)
             if progress_lines:
-                sections.append("**Tools**\n" + "\n".join(progress_lines))
-            if response_text.strip():
-                sections.append("**Reply**\n" + response_text)
-            elif progress_lines or thinking_text:
-                sections.append("**Reply**\nGenerating...")
-            return "\n\n---\n\n".join(sections) or (response_text or "Generating...")
+                sections.append("**Tools**\n" + "\n\n".join(progress_lines))
+            if progress_lines or thinking_text:
+                sections.append("**Status**\nFinal reply will be sent as a new message.")
+            return "\n\n---\n\n".join(sections) or "**Status**\nWaiting for work to start."
 
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
@@ -7555,9 +7564,13 @@ class GatewayRunner:
                     return
                 duration = float(kwargs.get("duration", 0) or 0)
                 is_error = bool(kwargs.get("is_error", False))
-                status_emoji = "❌" if is_error else "✅"
-                result_preview = _format_tool_result_preview(kwargs.get("result_preview"))
-                progress_queue.put(("__tool_completed__", f"{status_emoji} {tool_name} ({duration:.1f}s)", result_preview))
+                completed_line = _format_tool_completed_line(
+                    tool_name or "tool",
+                    duration,
+                    is_error,
+                    kwargs.get("result_preview"),
+                )
+                progress_queue.put(("__tool_completed__", tool_name or "tool", completed_line))
                 return
 
             if event_type not in ("tool.started",):
@@ -7569,6 +7582,14 @@ class GatewayRunner:
 
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+
+            if single_card_enabled[0]:
+                progress_queue.put((
+                    "__tool_started__",
+                    tool_name or "tool",
+                    _format_tool_started_line(tool_name or "tool", emoji, preview),
+                ))
+                return
 
             if progress_mode == "verbose":
                 if args:
@@ -7642,10 +7663,20 @@ class GatewayRunner:
                     elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__thinking__":
                         unified_card_state["thinking"] = str(raw[1] or "")
                         msg = unified_card_state["thinking"]
-                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_completed__":
-                        _, base_msg, result_preview = raw
-                        line = base_msg if not result_preview else f"{base_msg}\n{result_preview}"
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
+                        _, tool_key, line = raw
                         progress_lines.append(line)
+                        active = unified_card_state["active_tool_indices"].setdefault(tool_key, [])
+                        active.append(len(progress_lines) - 1)
+                        msg = line
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_completed__":
+                        _, tool_key, line = raw
+                        active = unified_card_state["active_tool_indices"].get(tool_key) or []
+                        if active:
+                            idx = active.pop()
+                            progress_lines[idx] = line
+                        else:
+                            progress_lines.append(line)
                         msg = line
                     else:
                         msg = raw
@@ -7699,10 +7730,19 @@ class GatewayRunner:
                                     progress_lines[-1] = f"{base_msg} (x{count + 1})"
                             elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__thinking__":
                                 unified_card_state["thinking"] = str(raw[1] or "")
-                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_completed__":
-                                _, base_msg, result_preview = raw
-                                line = base_msg if not result_preview else f"{base_msg}\n{result_preview}"
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
+                                _, tool_key, line = raw
                                 progress_lines.append(line)
+                                active = unified_card_state["active_tool_indices"].setdefault(tool_key, [])
+                                active.append(len(progress_lines) - 1)
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_completed__":
+                                _, tool_key, line = raw
+                                active = unified_card_state["active_tool_indices"].get(tool_key) or []
+                                if active:
+                                    idx = active.pop()
+                                    progress_lines[idx] = line
+                                else:
+                                    progress_lines.append(line)
                             else:
                                 progress_lines.append(raw)
                         except Exception:
@@ -7881,9 +7921,6 @@ class GatewayRunner:
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
-                            message_id_holder=unified_card_message_id if single_card_enabled[0] else None,
-                            render_content=(lambda text: _render_progress_card(answer_text=text)) if single_card_enabled[0] else None,
-                            preserve_message_on_segment_break=single_card_enabled[0],
                         )
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta
