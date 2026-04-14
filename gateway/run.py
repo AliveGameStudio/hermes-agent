@@ -7482,6 +7482,7 @@ class GatewayRunner:
         unified_card_cursor = [""]
         unified_card_state = {
             "progress_lines": [],
+            "response_text": "",
             "thinking": "",
             "active_tool_indices": {},
         }
@@ -7503,15 +7504,21 @@ class GatewayRunner:
             return f"{header}\nPreview: `(none)`"
 
         def _format_tool_completed_line(tool_name: str, duration: float, is_error: bool, result_preview: Optional[str]) -> str:
-            compact_result = _compact_card_text(result_preview, limit=220)
+            result_text = str(result_preview or "").strip()
+            if len(result_text) > 5000:
+                result_text = result_text[:5000] + f"\n...[truncated {len(str(result_preview or '')) - 5000} chars]"
             header = f"{'❌' if is_error else '✅'} **{tool_name}** · {duration:.1f}s"
-            if compact_result:
-                return f"{header}\nResult: {compact_result}"
-            return f"{header}\nResult: `(no summary)`"
+            if result_text:
+                return f"{header}\nResult:\n````\n{result_text}\n````"
+            return f"{header}\nResult: `(no output)`"
 
-        def _render_progress_card(*, strip_cursor: bool = False) -> str:
+        def _render_progress_card(answer_text: Optional[str] = None, *, strip_cursor: bool = False) -> str:
+            if answer_text is not None:
+                unified_card_state["response_text"] = answer_text
+            response_text = str(unified_card_state.get("response_text") or "")
             thinking_text = str(unified_card_state.get("thinking") or "").strip()
             if strip_cursor and unified_card_cursor[0]:
+                response_text = response_text.replace(unified_card_cursor[0], "")
                 thinking_text = thinking_text.replace(unified_card_cursor[0], "")
             progress_lines = list(unified_card_state["progress_lines"])
 
@@ -7520,9 +7527,11 @@ class GatewayRunner:
                 sections.append("**Thinking**\n" + thinking_text)
             if progress_lines:
                 sections.append("**Tools**\n" + "\n\n".join(progress_lines))
-            if progress_lines or thinking_text:
-                sections.append("**Status**\nFinal reply will be sent as a new message.")
-            return "\n\n---\n\n".join(sections) or "**Status**\nWaiting for work to start."
+            if response_text.strip():
+                sections.append("**Reply**\n" + response_text)
+            elif progress_lines or thinking_text:
+                sections.append("**Reply**\nGenerating...")
+            return "\n\n---\n\n".join(sections) or "**Reply**\nGenerating..."
 
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
@@ -7661,7 +7670,10 @@ class GatewayRunner:
                             progress_lines[-1] = f"{base_msg} (x{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
                     elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__thinking__":
-                        unified_card_state["thinking"] = str(raw[1] or "")
+                        thinking_text = str(raw[1] or "")
+                        if len(thinking_text) > 600:
+                            thinking_text = thinking_text[:600] + "..."
+                        unified_card_state["thinking"] = thinking_text
                         msg = unified_card_state["thinking"]
                     elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
                         _, tool_key, line = raw
@@ -7921,6 +7933,9 @@ class GatewayRunner:
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            message_id_holder=unified_card_message_id if single_card_enabled[0] else None,
+                            render_content=(lambda text: _render_progress_card(answer_text=text)) if single_card_enabled[0] else None,
+                            preserve_message_on_segment_break=single_card_enabled[0],
                         )
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta

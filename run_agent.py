@@ -7106,7 +7106,9 @@ class AIAgent:
 
                 if self.tool_progress_callback:
                     try:
-                        result_preview = function_result[:400] if len(function_result) > 400 else function_result
+                        result_preview = function_result
+                        if len(result_preview) > 8000:
+                            result_preview = result_preview[:8000] + f"\n...[truncated {len(function_result) - 8000} chars]"
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
@@ -7442,7 +7444,9 @@ class AIAgent:
 
             if self.tool_progress_callback:
                 try:
-                    result_preview = function_result[:400] if len(function_result) > 400 else function_result
+                    result_preview = function_result
+                    if len(result_preview) > 8000:
+                        result_preview = result_preview[:8000] + f"\n...[truncated {len(function_result) - 8000} chars]"
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
