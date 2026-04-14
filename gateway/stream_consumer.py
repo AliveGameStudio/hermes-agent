@@ -480,6 +480,18 @@ class GatewayStreamConsumer:
             logger.error("Commentary send error: %s", e)
         return False
 
+    async def _send_stream_message(self, text: str):
+        sender = getattr(self.adapter, "send_stream_message", None)
+        if callable(sender):
+            return await sender(chat_id=self.chat_id, content=text, metadata=self.metadata)
+        return await self.adapter.send(chat_id=self.chat_id, content=text, metadata=self.metadata)
+
+    async def _edit_stream_message(self, text: str):
+        editor = getattr(self.adapter, "edit_stream_message", None)
+        if callable(editor):
+            return await editor(chat_id=self.chat_id, message_id=self._message_id, content=text)
+        return await self.adapter.edit_message(chat_id=self.chat_id, message_id=self._message_id, content=text)
+
     async def _send_or_edit(self, text: str) -> bool:
         """Send or edit the streaming message.
 
@@ -507,11 +519,7 @@ class GatewayStreamConsumer:
                     if text == self._last_sent_text:
                         return True
                     # Edit existing message
-                    result = await self.adapter.edit_message(
-                        chat_id=self.chat_id,
-                        message_id=self._message_id,
-                        content=text,
-                    )
+                    result = await self._edit_stream_message(text)
                     if result.success:
                         self._already_sent = True
                         self._last_sent_text = text
@@ -563,11 +571,7 @@ class GatewayStreamConsumer:
                     return False
             else:
                 # First message — send new
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    metadata=self.metadata,
-                )
+                result = await self._send_stream_message(text)
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
