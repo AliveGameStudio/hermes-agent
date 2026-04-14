@@ -21,7 +21,7 @@ import queue
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -70,11 +70,17 @@ class GatewayStreamConsumer:
         chat_id: str,
         config: Optional[StreamConsumerConfig] = None,
         metadata: Optional[dict] = None,
+        message_id_holder: Optional[list] = None,
+        render_content: Optional[Callable[[str], str]] = None,
+        preserve_message_on_segment_break: bool = False,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
+        self._message_id_holder = message_id_holder
+        self._render_content = render_content
+        self._preserve_message_on_segment_break = preserve_message_on_segment_break
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
@@ -82,6 +88,7 @@ class GatewayStreamConsumer:
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
+        self._last_raw_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._flood_strikes = 0         # Consecutive flood-control edit failures
@@ -131,6 +138,22 @@ class GatewayStreamConsumer:
     def finish(self) -> None:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
+
+    def _sync_message_id_from_holder(self) -> None:
+        if self._message_id is None and self._message_id_holder:
+            holder_id = self._message_id_holder[0]
+            if holder_id:
+                self._message_id = str(holder_id)
+                self._already_sent = True
+
+    def _sync_message_id_to_holder(self) -> None:
+        if self._message_id_holder is not None and self._message_id and self._message_id != "__no_edit__":
+            self._message_id_holder[0] = str(self._message_id)
+
+    def _render_payload(self, text: str) -> str:
+        if callable(self._render_content):
+            return self._render_content(text)
+        return text
 
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
@@ -249,10 +272,15 @@ class GatewayStreamConsumer:
                     return
 
                 if commentary_text is not None:
-                    self._reset_segment_state()
-                    await self._send_commentary(commentary_text)
-                    self._last_edit_time = time.monotonic()
-                    self._reset_segment_state()
+                    if self._preserve_message_on_segment_break and self._render_content is not None:
+                        self._accumulated = self._clean_for_display(commentary_text)
+                        await self._send_or_edit(self._accumulated)
+                        self._last_edit_time = time.monotonic()
+                    else:
+                        self._reset_segment_state()
+                        await self._send_commentary(commentary_text)
+                        self._last_edit_time = time.monotonic()
+                        self._reset_segment_state()
 
                 # Tool boundary: reset message state so the next text chunk
                 # creates a fresh message below any tool-progress messages.
@@ -268,7 +296,7 @@ class GatewayStreamConsumer:
                 # (When editing fails mid-stream due to flood control the id is
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
-                if got_segment_break:
+                if got_segment_break and not self._preserve_message_on_segment_break:
                     self._reset_segment_state(preserve_no_edit=True)
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
@@ -338,7 +366,7 @@ class GatewayStreamConsumer:
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
-        prefix = self._last_sent_text or ""
+        prefix = self._last_raw_text or ""
         if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
             prefix = prefix[:-len(self.cfg.cursor)]
         return self._clean_for_display(prefix)
@@ -415,7 +443,9 @@ class GatewayStreamConsumer:
                     self._already_sent = True
                     self._final_response_sent = True
                     self._message_id = last_message_id
+                    self._sync_message_id_to_holder()
                     self._last_sent_text = last_successful_chunk
+                    self._last_raw_text = last_successful_chunk
                     self._fallback_prefix = ""
                     return
                 # No fallback chunk reached the user — allow the normal gateway
@@ -430,9 +460,11 @@ class GatewayStreamConsumer:
             last_message_id = result.message_id or last_message_id
 
         self._message_id = last_message_id
+        self._sync_message_id_to_holder()
         self._already_sent = True
         self._final_response_sent = True
         self._last_sent_text = chunks[-1]
+        self._last_raw_text = chunks[-1]
         self._fallback_prefix = ""
 
     def _is_flood_error(self, result) -> bool:
@@ -447,18 +479,17 @@ class GatewayStreamConsumer:
         Called when entering fallback mode so the user doesn't see a stuck
         cursor (▉) in the partial message.
         """
+        self._sync_message_id_from_holder()
         if not self._message_id or self._message_id == "__no_edit__":
             return
         prefix = self._visible_prefix()
         if not prefix or not prefix.strip():
             return
         try:
-            await self.adapter.edit_message(
-                chat_id=self.chat_id,
-                message_id=self._message_id,
-                content=prefix,
-            )
-            self._last_sent_text = prefix
+            rendered_prefix = self._render_payload(prefix)
+            await self._edit_stream_message(rendered_prefix)
+            self._last_sent_text = rendered_prefix
+            self._last_raw_text = prefix
         except Exception:
             pass  # best-effort — don't let this block the fallback path
 
@@ -499,98 +530,76 @@ class GatewayStreamConsumer:
         False otherwise.  Callers like the overflow split loop use this to
         decide whether to advance past the delivered chunk.
         """
-        # Strip MEDIA: directives so they don't appear as visible text.
-        # Media files are delivered as native attachments after the stream
-        # finishes (via _deliver_media_from_response in gateway/run.py).
-        text = self._clean_for_display(text)
-        # A bare streaming cursor is not meaningful user-visible content and
-        # can render as a stray tofu/white-box message on some clients.
-        visible_without_cursor = text
+        raw_text = self._clean_for_display(text)
+        visible_without_cursor = raw_text
         if self.cfg.cursor:
             visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
         if not visible_without_cursor.strip():
-            return True  # cursor-only / whitespace-only update
-        if not text.strip():
-            return True  # nothing to send is "success"
+            return True
+        if not raw_text.strip():
+            return True
+
+        display_text = self._render_payload(raw_text)
+        self._sync_message_id_from_holder()
+
         try:
             if self._message_id is not None:
                 if self._edit_supported:
-                    # Skip if text is identical to what we last sent
-                    if text == self._last_sent_text:
+                    if display_text == self._last_sent_text:
                         return True
-                    # Edit existing message
-                    result = await self._edit_stream_message(text)
+                    result = await self._edit_stream_message(display_text)
                     if result.success:
                         self._already_sent = True
-                        self._last_sent_text = text
-                        # Successful edit — reset flood strike counter
+                        self._last_sent_text = display_text
+                        self._last_raw_text = raw_text
+                        self._sync_message_id_to_holder()
                         self._flood_strikes = 0
                         return True
-                    else:
-                        # Edit failed.  If this looks like flood control / rate
-                        # limiting, use adaptive backoff: double the edit interval
-                        # and retry on the next cycle.  Only permanently disable
-                        # edits after _MAX_FLOOD_STRIKES consecutive failures.
-                        if self._is_flood_error(result):
-                            self._flood_strikes += 1
-                            self._current_edit_interval = min(
-                                self._current_edit_interval * 2, 10.0,
-                            )
-                            logger.debug(
-                                "Flood control on edit (strike %d/%d), "
-                                "backoff interval → %.1fs",
-                                self._flood_strikes,
-                                self._MAX_FLOOD_STRIKES,
-                                self._current_edit_interval,
-                            )
-                            if self._flood_strikes < self._MAX_FLOOD_STRIKES:
-                                # Don't disable edits yet — just slow down.
-                                # Update _last_edit_time so the next edit
-                                # respects the new interval.
-                                self._last_edit_time = time.monotonic()
-                                return False
-
-                        # Non-flood error OR flood strikes exhausted: enter
-                        # fallback mode — send only the missing tail once the
-                        # final response is available.
-                        logger.debug(
-                            "Edit failed (strikes=%d), entering fallback mode",
-                            self._flood_strikes,
+                    if self._is_flood_error(result):
+                        self._flood_strikes += 1
+                        self._current_edit_interval = min(
+                            self._current_edit_interval * 2, 10.0,
                         )
-                        self._fallback_prefix = self._visible_prefix()
-                        self._fallback_final_send = True
-                        self._edit_supported = False
-                        self._already_sent = True
-                        # Best-effort: strip the cursor from the last visible
-                        # message so the user doesn't see a stuck ▉.
-                        await self._try_strip_cursor()
-                        return False
-                else:
-                    # Editing not supported — skip intermediate updates.
-                    # The final response will be sent by the fallback path.
-                    return False
-            else:
-                # First message — send new
-                result = await self._send_stream_message(text)
-                if result.success:
-                    if result.message_id:
-                        self._message_id = result.message_id
-                    else:
-                        self._edit_supported = False
-                    self._already_sent = True
-                    self._last_sent_text = text
-                    if not result.message_id:
-                        self._fallback_prefix = self._visible_prefix()
-                        self._fallback_final_send = True
-                        # Sentinel prevents re-entering the first-send path on
-                        # every delta/tool boundary when platforms accept a
-                        # message but do not return an editable message id.
-                        self._message_id = "__no_edit__"
-                    return True
-                else:
-                    # Initial send failed — disable streaming for this session
+                        logger.debug(
+                            "Flood control on edit (strike %d/%d), backoff interval → %.1fs",
+                            self._flood_strikes,
+                            self._MAX_FLOOD_STRIKES,
+                            self._current_edit_interval,
+                        )
+                        if self._flood_strikes < self._MAX_FLOOD_STRIKES:
+                            self._last_edit_time = time.monotonic()
+                            return False
+
+                    logger.debug(
+                        "Edit failed (strikes=%d), entering fallback mode",
+                        self._flood_strikes,
+                    )
+                    self._fallback_prefix = self._visible_prefix()
+                    self._fallback_final_send = True
                     self._edit_supported = False
+                    self._already_sent = True
+                    await self._try_strip_cursor()
                     return False
+                return False
+
+            result = await self._send_stream_message(display_text)
+            if result.success:
+                if result.message_id:
+                    self._message_id = result.message_id
+                    self._sync_message_id_to_holder()
+                else:
+                    self._edit_supported = False
+                self._already_sent = True
+                self._last_sent_text = display_text
+                self._last_raw_text = raw_text
+                if not result.message_id:
+                    self._fallback_prefix = self._visible_prefix()
+                    self._fallback_final_send = True
+                    self._message_id = "__no_edit__"
+                return True
+
+            self._edit_supported = False
+            return False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
             return False

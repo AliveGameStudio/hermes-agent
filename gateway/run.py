@@ -7468,75 +7468,53 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        
-        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
-            """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue:
-                return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in ("tool.started",):
-                return
+        _card_adapter = self.adapters.get(source.platform)
+        single_card_enabled = [
+            bool(
+                source.platform == Platform.FEISHU
+                and _card_adapter
+                and callable(getattr(_card_adapter, "send_stream_message", None))
+                and callable(getattr(_card_adapter, "edit_stream_message", None))
+            )
+        ]
+        unified_card_message_id = [None]
+        unified_card_cursor = [""]
+        unified_card_state = {
+            "progress_lines": [],
+            "response_text": "",
+            "thinking": "",
+        }
 
-            # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
-                return
-            last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
-            from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(tool_name, default="⚙️")
-            
-            # Verbose mode: show detailed arguments, respects tool_preview_length
-            if progress_mode == "verbose":
-                if args:
-                    from agent.display import get_tool_preview_max_len
-                    _pl = get_tool_preview_max_len()
-                    import json as _json
-                    args_str = _json.dumps(args, ensure_ascii=False, default=str)
-                    # When tool_preview_length is 0 (default), don't truncate
-                    # in verbose mode — the user explicitly asked for full
-                    # detail.  Platform message-length limits handle the rest.
-                    if _pl > 0 and len(args_str) > _pl:
-                        args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                elif preview:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
-                else:
-                    msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
-                return
-            
-            # "all" / "new" modes: short preview, respects tool_preview_length
-            # config (defaults to 40 chars when unset to keep gateway messages
-            # compact — unlike CLI spinners, these persist as permanent messages).
-            if preview:
-                from agent.display import get_tool_preview_max_len
-                _pl = get_tool_preview_max_len()
-                _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
-            else:
-                msg = f"{emoji} {tool_name}..."
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
-                repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
-                return
-            last_progress_msg[0] = msg
-            repeat_count[0] = 0
-            
-            progress_queue.put(msg)
-        
-        # Background task to send progress messages
-        # Accumulates tool lines into a single message that gets edited.
-        #
+        def _format_tool_result_preview(result_preview: Optional[str]) -> str:
+            text = str(result_preview or "").strip()
+            if not text:
+                return ""
+            text = " ".join(text.split())
+            if len(text) > 280:
+                text = text[:277] + "..."
+            return f"-> {text}"
+
+        def _render_progress_card(answer_text: Optional[str] = None, *, strip_cursor: bool = False) -> str:
+            if answer_text is not None:
+                unified_card_state["response_text"] = answer_text
+            response_text = str(unified_card_state.get("response_text") or "")
+            if strip_cursor and unified_card_cursor[0]:
+                response_text = response_text.replace(unified_card_cursor[0], "")
+            thinking_text = str(unified_card_state.get("thinking") or "").strip()
+            progress_lines = list(unified_card_state["progress_lines"])
+
+            sections = []
+            if thinking_text:
+                sections.append("**Thinking**\n" + thinking_text)
+            if progress_lines:
+                sections.append("**Tools**\n" + "\n".join(progress_lines))
+            if response_text.strip():
+                sections.append("**Reply**\n" + response_text)
+            elif progress_lines or thinking_text:
+                sections.append("**Reply**\nGenerating...")
+            return "\n\n---\n\n".join(sections) or (response_text or "Generating...")
+
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
         # - Telegram uses message_thread_id only for forum topics; passing a
@@ -7548,6 +7526,87 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
+        async def _send_progress_payload(adapter, content: str):
+            if single_card_enabled[0]:
+                sender = getattr(adapter, "send_stream_message", None)
+                if callable(sender):
+                    return await sender(chat_id=source.chat_id, content=content, metadata=_progress_metadata)
+            return await adapter.send(chat_id=source.chat_id, content=content, metadata=_progress_metadata)
+
+        async def _edit_progress_payload(adapter, message_id: str, content: str):
+            if single_card_enabled[0]:
+                editor = getattr(adapter, "edit_stream_message", None)
+                if callable(editor):
+                    return await editor(chat_id=source.chat_id, message_id=message_id, content=content)
+            return await adapter.edit_message(chat_id=source.chat_id, message_id=message_id, content=content)
+
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            """Callback invoked by agent on tool lifecycle events."""
+            if not progress_queue:
+                return
+
+            if event_type == "reasoning.available":
+                if single_card_enabled[0] and preview:
+                    progress_queue.put(("__thinking__", preview[:400]))
+                return
+
+            if event_type == "tool.completed":
+                if not single_card_enabled[0]:
+                    return
+                duration = float(kwargs.get("duration", 0) or 0)
+                is_error = bool(kwargs.get("is_error", False))
+                status_emoji = "❌" if is_error else "✅"
+                result_preview = _format_tool_result_preview(kwargs.get("result_preview"))
+                progress_queue.put(("__tool_completed__", f"{status_emoji} {tool_name} ({duration:.1f}s)", result_preview))
+                return
+
+            if event_type not in ("tool.started",):
+                return
+
+            if progress_mode == "new" and tool_name == last_tool[0]:
+                return
+            last_tool[0] = tool_name
+
+            from agent.display import get_tool_emoji
+            emoji = get_tool_emoji(tool_name, default="⚙️")
+
+            if progress_mode == "verbose":
+                if args:
+                    from agent.display import get_tool_preview_max_len
+                    _pl = get_tool_preview_max_len()
+                    import json as _json
+                    args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                    if _pl > 0 and len(args_str) > _pl:
+                        args_str = args_str[:_pl - 3] + "..."
+                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                elif preview:
+                    msg = f"{emoji} {tool_name}: \"{preview}\""
+                else:
+                    msg = f"{emoji} {tool_name}..."
+                progress_queue.put(msg)
+                return
+
+            if preview:
+                from agent.display import get_tool_preview_max_len
+                _pl = get_tool_preview_max_len()
+                _cap = _pl if _pl > 0 else 40
+                if len(preview) > _cap:
+                    preview = preview[:_cap - 3] + "..."
+                msg = f"{emoji} {tool_name}: \"{preview}\""
+            else:
+                msg = f"{emoji} {tool_name}..."
+
+            if msg == last_progress_msg[0]:
+                repeat_count[0] += 1
+                progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                return
+            last_progress_msg[0] = msg
+            repeat_count[0] = 0
+
+            progress_queue.put(msg)
+
+        # Background task to send progress messages
+        # Accumulates tool lines into a single message that gets edited.
         async def send_progress_messages():
             if not progress_queue:
                 return
@@ -7556,11 +7615,8 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            # Skip tool progress for platforms that don't support message
-            # editing (e.g. iMessage/BlueBubbles) — each progress update
-            # would become a separate message bubble, which is noisy.
             from gateway.platforms.base import BasePlatformAdapter as _BaseAdapter
-            if type(adapter).edit_message is _BaseAdapter.edit_message:
+            if type(adapter).edit_message is _BaseAdapter.edit_message and not single_card_enabled[0]:
                 while not progress_queue.empty():
                     try:
                         progress_queue.get_nowait()
@@ -7568,107 +7624,100 @@ class GatewayRunner:
                         break
                 return
 
-            progress_lines = []      # Accumulated tool lines
-            progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
-            _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
-            _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+            progress_lines = unified_card_state["progress_lines"] if single_card_enabled[0] else []
+            progress_msg_id = None
+            can_edit = True
+            _last_edit_ts = 0.0
+            _PROGRESS_EDIT_INTERVAL = 1.5
 
             while True:
                 try:
                     raw = progress_queue.get_nowait()
 
-                    # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                            progress_lines[-1] = f"{base_msg} (x{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__thinking__":
+                        unified_card_state["thinking"] = str(raw[1] or "")
+                        msg = unified_card_state["thinking"]
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_completed__":
+                        _, base_msg, result_preview = raw
+                        line = base_msg if not result_preview else f"{base_msg}\n{result_preview}"
+                        progress_lines.append(line)
+                        msg = line
                     else:
                         msg = raw
                         progress_lines.append(msg)
 
-                    # Throttle edits: batch rapid tool updates into fewer
-                    # API calls to avoid hitting Telegram flood control.
-                    # (grammY auto-retry pattern: proactively rate-limit
-                    # instead of reacting to 429s.)
                     _now = time.monotonic()
                     _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
                     if _remaining > 0:
-                        # Wait out the throttle interval, then loop back to
-                        # drain any additional queued messages before sending
-                        # a single batched edit.
                         await asyncio.sleep(_remaining)
                         continue
 
+                    if progress_msg_id is None and unified_card_message_id[0]:
+                        progress_msg_id = unified_card_message_id[0]
+
+                    full_text = _render_progress_card(strip_cursor=True) if single_card_enabled[0] else "\n".join(progress_lines)
+
                     if can_edit and progress_msg_id is not None:
-                        # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
-                        result = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=progress_msg_id,
-                            content=full_text,
-                        )
+                        result = await _edit_progress_payload(adapter, progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
                             if "flood" in _err or "retry after" in _err:
-                                # Flood control hit — disable further edits,
-                                # switch to sending new messages only for
-                                # important updates.  Don't block 23s.
                                 logger.info(
                                     "[%s] Progress edits disabled due to flood control",
                                     adapter.name,
                                 )
                             can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            await _send_progress_payload(adapter, msg)
                     else:
                         if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            result = await _send_progress_payload(adapter, full_text)
                         else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            result = await _send_progress_payload(adapter, msg)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
+                            unified_card_message_id[0] = result.message_id
 
                     _last_edit_ts = time.monotonic()
 
-                    # Restore typing indicator
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
                             if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                    progress_lines[-1] = f"{base_msg} (x{count + 1})"
+                            elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__thinking__":
+                                unified_card_state["thinking"] = str(raw[1] or "")
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_completed__":
+                                _, base_msg, result_preview = raw
+                                line = base_msg if not result_preview else f"{base_msg}\n{result_preview}"
+                                progress_lines.append(line)
                             else:
                                 progress_lines.append(raw)
                         except Exception:
                             break
-                    # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress_card(strip_cursor=True) if single_card_enabled[0] else "\n".join(progress_lines)
                         try:
-                            await adapter.edit_message(
-                                chat_id=source.chat_id,
-                                message_id=progress_msg_id,
-                                content=full_text,
-                            )
+                            await _edit_progress_payload(adapter, progress_msg_id, full_text)
                         except Exception:
                             pass
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
-        
+
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
@@ -7801,7 +7850,7 @@ class GatewayRunner:
                 else bool(_plat_streaming)
             )
             _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            _want_interim_messages = interim_assistant_messages_enabled and not single_card_enabled[0]
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -7821,6 +7870,7 @@ class GatewayRunner:
                         # streaming text on Matrix, but suppress the cursor.
                         if source.platform == Platform.MATRIX:
                             _effective_cursor = ""
+                        unified_card_cursor[0] = _effective_cursor if single_card_enabled[0] else ""
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
@@ -7831,6 +7881,9 @@ class GatewayRunner:
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            message_id_holder=unified_card_message_id if single_card_enabled[0] else None,
+                            render_content=(lambda text: _render_progress_card(answer_text=text)) if single_card_enabled[0] else None,
+                            preserve_message_on_segment_break=single_card_enabled[0],
                         )
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta

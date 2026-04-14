@@ -7106,9 +7106,11 @@ class AIAgent:
 
                 if self.tool_progress_callback:
                     try:
+                        result_preview = function_result[:400] if len(function_result) > 400 else function_result
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            result_preview=result_preview,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -7440,9 +7442,11 @@ class AIAgent:
 
             if self.tool_progress_callback:
                 try:
+                    result_preview = function_result[:400] if len(function_result) > 400 else function_result
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        result_preview=result_preview,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
